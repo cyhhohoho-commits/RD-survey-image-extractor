@@ -127,6 +127,9 @@
     cursor:pointer;transition:background .14s;border:none;width:100%;font-family:inherit;
   }
   .dl:hover{background:#e4e0fb}
+  .wordopt{display:flex;align-items:center;gap:6px;font-size:12.5px;font-weight:600;color:var(--ink-soft);cursor:pointer;user-select:none}
+  .wordopt input{width:15px;height:15px;accent-color:var(--accent);cursor:pointer;margin:0}
+  .wordopt span{color:var(--muted);font-weight:500}
   footer{margin-top:38px;text-align:center;font-size:12px;color:var(--muted);line-height:1.7}
   footer b{color:var(--ink-soft)}
 </style>
@@ -165,6 +168,7 @@
       </div>
     </div>
     <div class="acts">
+      <label class="wordopt" title="ZIP에 원본 워드파일을 함께 넣되, 워드 안의 이미지는 전부 JPG로 바꿔서 저장합니다. 레이아웃·크기는 그대로예요."><input type="checkbox" id="incWord" checked>워드도 포함 <span>(이미지 JPG 변환본)</span></label>
       <button class="btn" id="reset">다시 선택</button>
       <button class="btn primary" id="zipAll">전체 ZIP으로 저장</button>
     </div>
@@ -214,9 +218,11 @@ https://github.com/nodeca/pako/blob/main/LICENSE
   const zipBtn=document.getElementById('zipAll');
   const optJpg=document.getElementById('optJpg');
   const optOrig=document.getElementById('optOrig');
+  const incWord=document.getElementById('incWord');
 
   let items=[];        // {base, origExt, blob, url, w, h, size, convertible}
   let format='jpg';    // 'jpg' | 'orig'
+  let docxFiles=[];    // 업로드한 원본 docx File 객체들 (워드 JPG 변환본 생성용)
 
   function setStatus(msg, isErr){ statusEl.textContent=msg; statusEl.className='status show'+(isErr?' err':''); }
   function clearStatus(){ statusEl.className='status'; }
@@ -308,6 +314,7 @@ https://github.com/nodeca/pako/blob/main/LICENSE
     if(docxList.length===0){ setStatus('워드 파일(.docx)이 아니에요. .docx 파일을 올려주세요.',true); return; }
     setStatus('설문지를 읽는 중입니다…'); hintEl.className='hint';
     items.forEach(it=>URL.revokeObjectURL(it.url)); items=[]; grid.innerHTML='';
+    docxFiles=docxList;
 
     const multiDoc = docxList.length>1;
     for(const file of docxList){
@@ -389,6 +396,80 @@ https://github.com/nodeca/pako/blob/main/LICENSE
     });
   }
 
+  // 임의 이미지 blob → JPG blob (흰 배경, 원본 픽셀 크기 그대로). 변환 불가면 null
+  function blobToJpeg(blob){
+    return new Promise((resolve)=>{
+      const url=URL.createObjectURL(blob);
+      const im=new Image();
+      im.onload=()=>{
+        if(!im.naturalWidth||!im.naturalHeight){ URL.revokeObjectURL(url); resolve(null); return; }
+        const cv=document.createElement('canvas');
+        cv.width=im.naturalWidth; cv.height=im.naturalHeight;
+        const ctx=cv.getContext('2d');
+        ctx.fillStyle='#ffffff'; ctx.fillRect(0,0,cv.width,cv.height);
+        ctx.drawImage(im,0,0);
+        cv.toBlob(b=>{ URL.revokeObjectURL(url); resolve(b); }, 'image/jpeg', 0.92);
+      };
+      im.onerror=()=>{ URL.revokeObjectURL(url); resolve(null); };
+      im.src=url;
+    });
+  }
+
+  // 원본 docx의 내부 이미지를 전부 JPG로 교체한 .docx blob 생성 (크기·배치는 그대로)
+  async function makeJpegDocx(file){
+    const buf=await file.arrayBuffer();
+    const zip=await JSZip.loadAsync(buf);
+
+    // 변환 대상 media 수집 (png/gif/bmp/webp → jpg, 이미 jpg/jpeg/벡터는 유지)
+    const mediaPaths=[];
+    zip.forEach((p,e)=>{ if(!e.dir && /(^|\/)media\/[^/]+$/i.test(p)) mediaPaths.push(p); });
+
+    const renameMap={}; // 'image3.png' -> 'image3.jpg'
+    let converted=0;
+    for(const p of mediaPaths){
+      const ext=p.split('.').pop().toLowerCase();
+      if(!CONVERTIBLE.includes(ext)) continue;     // 벡터(wmf/emf) 등은 변환 불가 → 유지
+      if(ext==='jpg'||ext==='jpeg') continue;       // 이미 JPG → 유지
+      const data=await zip.file(p).async('blob');
+      const jpg=await blobToJpeg(data);
+      if(!jpg) continue;                            // 디코드 실패 → 원본 유지
+      const dir=p.slice(0,p.lastIndexOf('/')+1);
+      const baseNoExt=p.slice(p.lastIndexOf('/')+1, p.lastIndexOf('.'));
+      const newName=baseNoExt+'.jpg';
+      zip.remove(p);
+      zip.file(dir+newName, jpg);
+      renameMap[p.slice(p.lastIndexOf('/')+1)]=newName;
+      converted++;
+    }
+
+    if(converted>0){
+      // 모든 .rels 의 Target 파일명 갱신 (document/header/footer 등)
+      const relsPaths=[];
+      zip.forEach((p,e)=>{ if(!e.dir && p.toLowerCase().endsWith('.rels')) relsPaths.push(p); });
+      for(const rp of relsPaths){
+        let xml=await zip.file(rp).async('string'); let changed=false;
+        for(const oldN in renameMap){
+          if(xml.indexOf(oldN)!==-1){ xml=xml.split(oldN).join(renameMap[oldN]); changed=true; }
+        }
+        if(changed) zip.file(rp, xml);
+      }
+      // [Content_Types].xml 에 jpg/jpeg 기본 타입 보장
+      const ctPath='[Content_Types].xml';
+      if(zip.file(ctPath)){
+        let ct=await zip.file(ctPath).async('string'); let add='';
+        if(!/Extension="jpg"/i.test(ct)) add+='<Default Extension="jpg" ContentType="image/jpeg"/>';
+        if(!/Extension="jpeg"/i.test(ct)) add+='<Default Extension="jpeg" ContentType="image/jpeg"/>';
+        if(add){ ct=ct.replace('</Types>', add+'</Types>'); zip.file(ctPath, ct); }
+      }
+    }
+
+    const out=await zip.generateAsync({
+      type:'blob',
+      mimeType:'application/vnd.openxmlformats-officedocument.wordprocessingml.document'
+    });
+    return {blob:out, converted};
+  }
+
   async function blobFor(it){
     if(format==='jpg' && it.convertible) return await toJpeg(it);
     return it.blob;
@@ -423,6 +504,24 @@ https://github.com/nodeca/pako/blob/main/LICENSE
         else seen[name]=1;
         folder.file(name, blob);
       }
+      // 워드도 포함: 내부 이미지를 JPG로 교체한 .docx 추가
+      if(incWord.checked && docxFiles.length){
+        const wfolder=zip.folder('워드(이미지JPG변환)');
+        const wseen={};
+        for(let i=0;i<docxFiles.length;i++){
+          const f=docxFiles[i];
+          zipBtn.textContent='워드 변환 중… ('+(i+1)+'/'+docxFiles.length+')';
+          try{
+            const r=await makeJpegDocx(f);
+            const stem=f.name.replace(/\.docx$/i,'')+'_이미지JPG';
+            let wname=stem+'.docx';
+            if(wseen[wname]){ wseen[wname]++; wname=stem+'('+wseen[wname]+').docx'; }
+            else wseen[wname]=1;
+            wfolder.file(wname, r.blob);
+          }catch(e){ console.error('워드 변환 실패:', f.name, e); }
+        }
+      }
+      zipBtn.textContent='압축하는 중…';
       const content=await zip.generateAsync({type:'blob'});
       triggerDownload(content,'추출이미지.zip');
     }catch(err){ console.error(err); setStatus('ZIP으로 묶는 중 문제가 생겼어요.',true); }
@@ -444,7 +543,7 @@ https://github.com/nodeca/pako/blob/main/LICENSE
   }
 
   function resetAll(){
-    items.forEach(it=>URL.revokeObjectURL(it.url)); items=[]; grid.innerHTML='';
+    items.forEach(it=>URL.revokeObjectURL(it.url)); items=[]; docxFiles=[]; grid.innerHTML='';
     bar.classList.remove('show'); hintEl.className='hint'; clearStatus(); fileInput.value='';
   }
 
