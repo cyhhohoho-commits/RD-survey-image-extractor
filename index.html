@@ -249,6 +249,72 @@ https://github.com/nodeca/pako/blob/main/LICENSE
     return null;
   }
 
+  // ── 워드 자동 번호매기기 엔진 ─────────────────────────────
+  // 설문 문항번호(SQ1, A1, DQ1 등)가 본문 글자가 아니라 '번호매기기' 형식으로
+  // 들어있는 경우가 많다. numbering.xml의 형식(예: "SQ%1.")을 해석해 실제 번호를 만든다.
+  function fmtNum(n,f){
+    if(f==='upperLetter') return String.fromCharCode(65+(n-1)%26);
+    if(f==='lowerLetter') return String.fromCharCode(97+(n-1)%26);
+    if(f==='upperRoman'||f==='lowerRoman'){
+      const v=[[1000,'M'],[900,'CM'],[500,'D'],[400,'CD'],[100,'C'],[90,'XC'],[50,'L'],[40,'XL'],[10,'X'],[9,'IX'],[5,'V'],[4,'IV'],[1,'I']];
+      let s='',x=n; for(const [a,r] of v){ while(x>=a){ s+=r; x-=a; } }
+      return f==='lowerRoman'? s.toLowerCase(): s;
+    }
+    return String(n);
+  }
+  function makeNumberer(xml){
+    const W='http://schemas.openxmlformats.org/wordprocessingml/2006/main';
+    const n2a={}, absLvl={};
+    if(xml){
+      const doc=new DOMParser().parseFromString(xml,'application/xml');
+      const A=(el,name)=>el.getAttributeNS(W,name);
+      for(const num of doc.getElementsByTagNameNS(W,'num')){
+        const ab=num.getElementsByTagNameNS(W,'abstractNumId')[0];
+        if(ab) n2a[A(num,'numId')]=A(ab,'val');
+      }
+      for(const ab of doc.getElementsByTagNameNS(W,'abstractNum')){
+        const lvls={};
+        for(const lvl of ab.getElementsByTagNameNS(W,'lvl')){
+          const nf=lvl.getElementsByTagNameNS(W,'numFmt')[0];
+          const lt=lvl.getElementsByTagNameNS(W,'lvlText')[0];
+          const st=lvl.getElementsByTagNameNS(W,'start')[0];
+          lvls[A(lvl,'ilvl')]={numFmt: nf?A(nf,'val'):'decimal', lvlText: lt?A(lt,'val'):'', start: st?+A(st,'val'):1};
+        }
+        absLvl[A(ab,'abstractNumId')]=lvls;
+      }
+    }
+    const counters={};
+    return {
+      step(numId, ilvl){
+        const aid=n2a[numId]; if(aid==null) return '';
+        const lvls=absLvl[aid]; if(!lvls) return '';
+        const c=counters[numId]||(counters[numId]={});
+        const lv=lvls[ilvl]||{numFmt:'decimal',lvlText:'',start:1};
+        c[ilvl]=((ilvl in c)? c[ilvl] : lv.start-1)+1;
+        for(const k in c){ if(+k>ilvl) delete c[k]; }
+        let s=lv.lvlText||'';
+        for(let k=1;k<=9;k++){
+          const ph='%'+k;
+          if(s.indexOf(ph)>=0){
+            const cf=(lvls[k-1]||{}).numFmt||'decimal';
+            s=s.split(ph).join(fmtNum(c[k-1]||0, cf));
+          }
+        }
+        return s;
+      }
+    };
+  }
+
+  // 단락 문자열에서 번호매기기 정보(numId, ilvl) 추출
+  function getNumPr(para){
+    const npr=para.match(/<w:numPr>[\s\S]*?<\/w:numPr>/);
+    if(!npr) return null;
+    const nid=(npr[0].match(/<w:numId\s+w:val="(\d+)"/)||[])[1];
+    if(!nid) return null;
+    const il=+((npr[0].match(/<w:ilvl\s+w:val="(\d+)"/)||[])[1]||0);
+    return {numId:nid, ilvl:il};
+  }
+
   // docx 1개에서 (문항번호 라벨이 붙은) 이미지들 추출
   async function extractFromDocx(file){
     const buf=await file.arrayBuffer();
@@ -256,6 +322,8 @@ https://github.com/nodeca/pako/blob/main/LICENSE
     const docXml=await (zip.file('word/document.xml')||{async:async()=>''}).async('string');
     const relsFile=zip.file('word/_rels/document.xml.rels');
     const relsXml= relsFile ? await relsFile.async('string') : '';
+    const numFile=zip.file('word/numbering.xml');
+    const numberer=makeNumberer(numFile? await numFile.async('string') : '');
     const baseName=file.name.replace(/\.docx$/i,'');
 
     // rId -> media 경로
@@ -263,21 +331,33 @@ https://github.com/nodeca/pako/blob/main/LICENSE
     let rm; const relRe=/Id="(rId\d+)"[^>]*Target="([^"]*media\/[^"]+)"/g;
     while((rm=relRe.exec(relsXml))){ rid2path[rm[1]]='word/'+rm[2].replace(/^\.?\//,'').replace(/^\.\.\//,''); }
 
-    // 순서대로 텍스트/이미지 스캔하며 라벨 부여
-    const pat=/<w:t[^>]*>([^<]*)<\/w:t>|r:embed="(rId\d+)"|r:id="(rId\d+)"/g;
+    // 단락(w:p) 단위로 순회: 자동 번호매기기를 해석해 라벨로 쓰고, 단락 내 이미지에 부여
     let cur=null; const counter={}; const ordered=[]; const usedPaths=new Set();
-    let m;
-    while((m=pat.exec(docXml))){
-      if(m[1]!==undefined){
-        const lbl=detectLabel(m[1]); if(lbl) cur=lbl;
-      } else {
-        const rid=m[2]||m[3];
-        const path=rid2path[rid];
-        if(path && zip.file(path)){
-          const label=cur||'이미지';
-          counter[label]=(counter[label]||0)+1;
-          ordered.push({path,label,num:counter[label]});
-          usedPaths.add(path);
+    const paras=docXml.split(/(?=<w:p[ >])/);
+    for(const para of paras){
+      // 자동 번호매기기(numPr)가 있으면 그 번호를 만들어 문항 라벨로 사용
+      let autoLabel='';
+      const np=getNumPr(para);
+      if(np){
+        autoLabel=numberer.step(np.numId, np.ilvl);   // 카운터는 단락 순서대로 항상 진행
+        const lbl=detectLabel(autoLabel); if(lbl) cur=lbl;
+      }
+      // 단락 안의 텍스트/이미지를 순서대로 처리
+      const pat=/<w:t[^>]*>([^<]*)<\/w:t>|r:embed="(rId\d+)"|r:id="(rId\d+)"/g;
+      let m;
+      while((m=pat.exec(para))){
+        if(m[1]!==undefined){
+          // 자동번호가 없는 단락은 본문 글자에서 문항번호를 찾는다(직접 입력형 대비)
+          if(!autoLabel){ const lbl=detectLabel(m[1]); if(lbl) cur=lbl; }
+        } else {
+          const rid=m[2]||m[3];
+          const path=rid2path[rid];
+          if(path && zip.file(path)){
+            const label=cur||'이미지';
+            counter[label]=(counter[label]||0)+1;
+            ordered.push({path,label,num:counter[label]});
+            usedPaths.add(path);
+          }
         }
       }
     }
@@ -463,11 +543,48 @@ https://github.com/nodeca/pako/blob/main/LICENSE
       }
     }
 
+    // 자동 번호매기기 → 실제 글자로 고정 + numPr 제거 (화면 번호는 그대로, 자동속성만 제거)
+    const esc=s=>s.replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;');
+    let frozen=0;
+    {
+      const docFile=zip.file('word/document.xml');
+      const numFile=zip.file('word/numbering.xml');
+      if(docFile && numFile){
+        const numberer=makeNumberer(await numFile.async('string'));
+        const paras=(await docFile.async('string')).split(/(?=<w:p[ >])/);
+        for(let i=0;i<paras.length;i++){
+          const np=getNumPr(paras[i]);
+          if(!np) continue;
+          const numText=numberer.step(np.numId, np.ilvl);   // 추출과 동일 순서 → 동일 번호
+          let para=paras[i].replace(/<w:numPr>[\s\S]*?<\/w:numPr>/, '');  // 자동매기기 제거
+          if(numText){
+            const ins=esc(numText)+' ';
+            if(/<w:t[ />]/.test(para)){
+              // 첫 w:t 앞에 번호 글자 삽입 (공백 보존)
+              para=para.replace(/(<w:t)([^>]*?)(\/?>)/, (mm,a,b,c)=>{
+                if(c==='/>') return a+b+'>'+ins+'</w:t>';
+                const b2=/xml:space=/.test(b)? b : b+' xml:space="preserve"';
+                return a+b2+c+ins;
+              });
+            } else {
+              // 글자가 없는 단락(이미지 등)이면 번호 run을 새로 끼움
+              const run='<w:r><w:t xml:space="preserve">'+ins+'</w:t></w:r>';
+              para = /<\/w:pPr>/.test(para)? para.replace('</w:pPr>','</w:pPr>'+run)
+                                           : para.replace(/(<w:p[^>]*>)/, '$1'+run);
+            }
+            frozen++;
+          }
+          paras[i]=para;
+        }
+        if(frozen>0) zip.file('word/document.xml', paras.join(''));
+      }
+    }
+
     const out=await zip.generateAsync({
       type:'blob',
       mimeType:'application/vnd.openxmlformats-officedocument.wordprocessingml.document'
     });
-    return {blob:out, converted};
+    return {blob:out, converted, frozen};
   }
 
   async function blobFor(it){
